@@ -682,6 +682,49 @@ mod tests {
         }
     }
 
+    /// Joined title copies move what the copies would have moved one by
+    /// one: all of it when every page is there; where a destination page
+    /// is not, the copy that holds it is left alone and the others are
+    /// made, as when each was its own step.
+    #[test]
+    fn joined_copies_end_as_the_copies_one_by_one() {
+        use windows_sys::Win32::System::Memory::*;
+        const P: usize = 1 << 16;
+        // SAFETY: a private region of ours, three blocks reserved; only
+        // committed pages are touched directly.
+        unsafe {
+            let src: Vec<u8> = (0..3 * P).map(|i| (i % 251) as u8 + 1).collect();
+            // (bytes of each copy) recorded one after the other.
+            let parts = [P - 100, 100 + 4096, P - 4096, P];
+            assert_eq!(parts.iter().sum::<usize>(), 3 * P);
+            for hole in [false, true] {
+                let base = VirtualAlloc(std::ptr::null(), 3 * P, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+                assert!(!base.is_null());
+                for block in 0..3 {
+                    if hole && block == 1 {
+                        continue;
+                    }
+                    let at = base.add(block * P);
+                    assert_eq!(VirtualAlloc(at.cast(), P, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                }
+                super::copy_joined(base as usize, src.as_ptr() as usize, &parts);
+                // Every copy that does not meet the hole is made, the one
+                // after it too. A copy that meets it is left alone; its
+                // pages before the hole may hold what the kernel wrote
+                // before it stopped, as a single copy's attempt leaves them.
+                let mut at = 0;
+                for (i, &n) in parts.iter().enumerate() {
+                    if !(hole && at < 2 * P && at + n > P) {
+                        let got = std::slice::from_raw_parts(base.add(at), n);
+                        assert_eq!(got, &src[at..at + n], "hole {hole} copy {i}");
+                    }
+                    at += n;
+                }
+                assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1491,8 +1534,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// once (on by default; `VICTORY_CARD_REHASH_RUNS=0` makes a pass per
+/// range sent up, as before).
 ///
 /// These passes are ours, they run on the card before every submission's
 /// lists, and no timing so far names them: each walks its 64 KiB pieces
@@ -1500,10 +1543,14 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// the time of one piece however few its pieces are. Run 102 sent up 514
 /// ranges a frame: 514 such passes. The same pieces are hashed either way;
 /// a piece hashed when it need not be, or not hashed when it should, costs
-/// a fetch that finds nothing and loses no shader write.
+/// a fetch that finds nothing and loses no shader write. The hash pass
+/// hashes whole pieces whatever range named them (the shader takes only
+/// the run's first piece and count), so a run of joined pieces stores the
+/// hashes the passes per range stored, each once
+/// (`crate::shadow::joined_piece_runs`).
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1552,8 +1599,10 @@ struct CardPlan {
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
-    /// buffer copies, which later refreshes must see.
-    Copy(usize, usize, usize),
+    /// buffer copies, which later refreshes must see. With copies joined
+    /// ([`join_copies`]) the bytes of each copy recorded, in order (empty
+    /// for one copy alone): a joined copy that fails goes copy by copy.
+    Copy(usize, usize, usize, Vec<usize>),
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
@@ -2051,7 +2100,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     for list in runs {
         for step in &list.deferred().copies {
             match step {
-                &Step::Copy(dst, src, len) => {
+                &Step::Copy(dst, src, len, _) => {
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
@@ -2519,7 +2568,39 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{RangesByCopy, continues, join_ranges, touches};
+
+    /// Ranges are gathered per copy, each once, in the order first given,
+    /// as the search of lists did.
+    #[test]
+    fn declared_ranges_gather_per_copy_once_each() {
+        let given = [(7, (0, 16)), (3, (8, 24)), (7, (0, 16)), (7, (32, 48)), (3, (8, 24)), (9, (1, 2)), (7, (0, 17))];
+        let mut by = RangesByCopy::default();
+        let mut made = Vec::new();
+        for (key, range) in given {
+            by.add(key, || {
+                made.push(key);
+                format!("copy {key}")
+            }, range);
+        }
+        // Each copy's entry made once.
+        assert_eq!(made, [7, 3, 9]);
+        // As the old search did it.
+        let mut old: Vec<(String, Vec<(usize, usize)>)> = Vec::new();
+        for (key, range) in given {
+            let name = format!("copy {key}");
+            match old.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, ranges)) => {
+                    if !ranges.contains(&range) {
+                        ranges.push(range);
+                    }
+                }
+                None => old.push((name, vec![range])),
+            }
+        }
+        assert_eq!(by.ranges, old);
+        assert_eq!(by.ranges[0].1, [(0, 16), (32, 48), (0, 17)]);
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -2570,8 +2651,8 @@ mod late_tests {
 }
 
 /// Whether a title buffer copy that continues the one recorded before it
-/// in its list becomes one step with it (`VICTORY_JOIN_COPIES=1`; off by
-/// default).
+/// in its list becomes one step with it (on by default;
+/// `VICTORY_JOIN_COPIES=0` keeps every copy a step of its own, as before).
 ///
 /// Each copy is done at submission through the kernel, which reports a
 /// page that is not there instead of faulting (`copy_mapped`), tells the
@@ -2583,13 +2664,14 @@ mod late_tests {
 ///
 /// Joined, the same bytes move: [`continues`] joins only copies whose
 /// ranges, taken together, do not overlap, and nothing is recorded between
-/// two steps that follow each other. What differs: a page that is not
-/// mapped now fails the joined copy as a whole (it then goes page by page,
-/// zeros for what cannot be read, as a single copy does), where before
-/// only the copy that held it did.
+/// two steps that follow each other (the refreshes a copy ends are ended
+/// by the first). A joined copy that fails (a page of either side is not
+/// there) is made again copy by copy ([`copy_joined`]), each as it would
+/// have been alone: a destination not all mapped leaves that copy alone
+/// and no other.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -2613,23 +2695,57 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut back: Vec<Declared> = Vec::new();
+    declared_where(runs, |_| true)
+}
+
+/// [`declared_writes`] of the host copies `which` takes.
+fn declared_where(runs: &[&HostList], which: impl Fn(&crate::shadow::Shadow) -> bool) -> Vec<Declared> {
+    let mut back = RangesByCopy::default();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
-                let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![range])),
-                }
+            if let Step::GpuWrite(shadow, address, len) = step
+                && which(shadow)
+            {
+                back.add(std::sync::Arc::as_ptr(shadow) as usize, || shadow.clone(), (*address, *address + *len));
             }
         }
     }
-    back
+    back.ranges
+}
+
+/// Ranges gathered per host copy, each once, copies and ranges in the order
+/// first given. Dispatches declare the same few ranges thousands of times
+/// a submission: a search of the copies and of each copy's ranges for every
+/// one of them grew with the square of the ranges.
+struct RangesByCopy<T> {
+    ranges: Vec<(T, Vec<(usize, usize)>)>,
+    /// A copy's place in `ranges`, by its key.
+    at: std::collections::HashMap<usize, usize>,
+    /// What was given: key, range.
+    seen: std::collections::HashSet<(usize, usize, usize)>,
+}
+
+impl<T> Default for RangesByCopy<T> {
+    fn default() -> Self {
+        RangesByCopy { ranges: Vec::new(), at: Default::default(), seen: Default::default() }
+    }
+}
+
+impl<T> RangesByCopy<T> {
+    /// `range` of the copy `key` names; `copy` makes its entry the first
+    /// time.
+    fn add(&mut self, key: usize, copy: impl FnOnce() -> T, range: (usize, usize)) {
+        if !self.seen.insert((key, range.0, range.1)) {
+            return;
+        }
+        match self.at.entry(key) {
+            std::collections::hash_map::Entry::Occupied(at) => self.ranges[*at.get()].1.push(range),
+            std::collections::hash_map::Entry::Vacant(at) => {
+                at.insert(self.ranges.len());
+                self.ranges.push((copy(), vec![range]));
+            }
+        }
+    }
 }
 
 /// After `list` has run: the texels its read-backs copied into host
@@ -2973,24 +3089,7 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && shadow.carded()
-                {
-                    let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
-                }
-            }
-        }
+        let declared = declared_where(runs, crate::shadow::Shadow::carded);
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -4859,18 +4958,22 @@ impl HostList {
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
         // step.
-        if let Some(Step::Copy(d, s, n)) = deferred.copies.last_mut()
+        if let Some(Step::Copy(d, s, n, parts)) = deferred.copies.last_mut()
             && continues((*d, *s, *n), (dst as usize, src as usize, len))
         {
             COPIES_JOINED[1].fetch_add(1, Ordering::Relaxed);
             if join_copies() {
+                if parts.is_empty() {
+                    parts.push(*n);
+                }
+                parts.push(len);
                 *n += len;
                 return;
             }
         }
         deferred
             .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
+            .push(Step::Copy(dst as usize, src as usize, len, Vec::new()));
         deferred.refreshed.clear();
     }
 
@@ -5078,14 +5181,19 @@ impl HostList {
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
+                Step::Copy(dst, src, len, parts) => {
+                    let (dst, src, len) = (*dst, *src, *len);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    if parts.is_empty() {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    } else {
+                        copy_joined(dst, src, parts);
+                    }
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -5156,7 +5264,8 @@ impl HostList {
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
+/// a copy to a thread (on by default; `VICTORY_WIDE_REFRESH=0` refreshes
+/// them one after the other on the submitting thread, as before).
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
@@ -5166,10 +5275,14 @@ impl HostList {
 /// title memory. With the switch the copies of a flush (four or more) are
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
-/// they are for the title's threads.
+/// they are for the title's threads; a copy's own notes (which pages it
+/// took, what goes up to its card side) are its own. Two copies of the
+/// same title memory each read it and write only themselves, and the
+/// journal tells both of a page either asking found written, in whichever
+/// order they ask. A flush holds each copy once (`Batch::add`).
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -5317,9 +5430,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // time in gameplay (run 60: 71 of 500 looks). The kernel's copy below
     // says the same when it fails, so the question is only asked then.
     // `VICTORY_COPY_ASK=1` asks first, as before.
-    static ASK: OnceLock<bool> = OnceLock::new();
-    let ask_first = title_dst
-        && *ASK.get_or_init(|| std::env::var_os("VICTORY_COPY_ASK").is_some_and(|v| v == "1"));
+    let ask_first = title_dst && copy_ask();
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
@@ -5352,6 +5463,43 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+}
+
+/// `VICTORY_COPY_ASK=1`: a copy into title memory asks first whether the
+/// destination is all mapped ([`copy_mapped`]).
+fn copy_ask() -> bool {
+    static ASK: OnceLock<bool> = OnceLock::new();
+    *ASK.get_or_init(|| std::env::var_os("VICTORY_COPY_ASK").is_some_and(|v| v == "1"))
+}
+
+/// Title buffer copies recorded one after the other that continue each
+/// other ([`join_copies`]): `parts` bytes each, from `src` to `dst`, as one
+/// call into the kernel. Where that fails (a page of either side is not
+/// there) each copy is made on its own with [`copy_mapped`], as it was
+/// recorded: a destination not all mapped leaves only that copy alone.
+fn copy_joined(dst: usize, src: usize, parts: &[usize]) {
+    let len: usize = parts.iter().sum();
+    #[cfg(feature = "diagnostics")]
+    let plain = crate::copystat::mode() != 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let plain = false;
+    if !plain && !copy_ask() && len > 0 {
+        // The kernel writes the destination: it must not be guarded.
+        crate::watch::writing(dst, len);
+        #[cfg(feature = "diagnostics")]
+        let moved = std::time::Instant::now();
+        let whole = read(src as *const u8, dst as *mut u8, len);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+        if whole {
+            return;
+        }
+    }
+    let mut at = 0;
+    for &n in parts {
+        copy_mapped((dst + at) as *mut u8, (src + at) as *const u8, n, true);
+        at += n;
+    }
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
@@ -5686,7 +5834,7 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=0 makes one per range: joined now {}), {compares:.0} compare passes",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
@@ -5714,7 +5862,7 @@ impl Meter {
             if copies > 0.0 {
                 tracing::info!(
                     "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
-                     (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
+                     (VICTORY_JOIN_COPIES=0 keeps them apart: joined now {})",
                     if join_copies() { "on" } else { "off" }
                 );
             }

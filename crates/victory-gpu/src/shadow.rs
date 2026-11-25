@@ -658,6 +658,57 @@ mod relay_tests {
         assert_eq!(outside(10, 50, vec![(0, 99)]), vec![]);
     }
 
+    /// `Shadow::writing` takes the parts of a new range that no declared
+    /// range holds with `outside`; it cut them out one declared range at a
+    /// time before. Both give the same bytes, in any arrangement.
+    #[test]
+    fn the_parts_to_snapshot_are_those_cut_one_range_at_a_time() {
+        fn cut_one_at_a_time(range: (usize, usize), declared: &[(usize, usize)]) -> Vec<(usize, usize)> {
+            let mut parts = vec![range];
+            for &(a, e) in declared {
+                let mut rest = Vec::new();
+                for (from, to) in parts {
+                    if e <= from || a >= to {
+                        rest.push((from, to));
+                        continue;
+                    }
+                    if from < a {
+                        rest.push((from, a));
+                    }
+                    if e < to {
+                        rest.push((e, to));
+                    }
+                }
+                parts = rest;
+            }
+            parts
+        }
+        let bytes = |parts: &[(usize, usize)]| {
+            let mut set: Vec<usize> = parts.iter().flat_map(|&(a, b)| a..b).collect();
+            set.sort_unstable();
+            set
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % n) as usize
+        };
+        for _ in 0..2000 {
+            let from = next(64);
+            let to = from + next(64);
+            let declared: Vec<(usize, usize)> = (0..next(6))
+                .map(|_| {
+                    let a = next(140);
+                    (a, a + next(40))
+                })
+                .collect();
+            let old = cut_one_at_a_time((from, to), &declared);
+            let new = outside(from, to, declared.iter().copied().filter(|&(a, e)| a < to && e > from).collect());
+            assert_eq!(bytes(&new), bytes(&old), "{from}..{to} {declared:?}");
+            assert!(new.iter().all(|&(a, b)| a < b));
+        }
+    }
+
     /// A model of a copy in the PC's memory under the relay: the card
     /// writes `copy` directly; `snap` is the snapshot; `title` is title
     /// memory. Flight A and flight B declare overlapping ranges and both
@@ -937,7 +988,8 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
+/// across ranges (on by default; `VICTORY_WIDE_BACK=0` takes and compares
+/// them range by range, as before).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -956,9 +1008,15 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// preparing (a declared range is left alone by every refresh, the title's
 /// own copies write title memory and not the copy, and the card runs the
 /// lists only afterwards).
+///
+/// A noted snapshot points into the copy's snapshot memory, which stays
+/// until every range of the copy is done with (`copy_back_done`): the range
+/// just declared is one, and its copy-back comes after the submission is
+/// sent. With the relay an earlier flight may land meanwhile; its merge
+/// touches only its own declared ranges, which a noted part never holds.
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -1785,24 +1843,19 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+        // One pass over the declared ranges that meet it (a cut per
+        // declared range was a fresh list for each of them, for every new
+        // range: quadratic in a copy's hundreds of declared ranges).
+        let (from, to) = self.inside(address, len);
+        let parts = outside(
+            from,
+            to,
+            pending
+                .iter()
+                .map(|&(a, e)| self.inside(a, e - a))
+                .filter(|&(a, e)| a < to && e > from)
+                .collect(),
+        );
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
