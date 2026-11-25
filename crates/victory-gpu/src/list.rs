@@ -153,6 +153,28 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
 }
 
+/// As [`with_state`], for a draw, dispatch or indirect execution: its time
+/// is counted ([`take_recording_us`]).
+#[cfg(windows)]
+fn with_work(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    let started = std::time::Instant::now();
+    with_state(this, f);
+    RECORDING_NS.fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Nanoseconds the recording threads spent in draws, dispatches and
+/// indirect executions, since the last [`take_recording_us`].
+#[cfg(windows)]
+static RECORDING_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Microseconds the recording threads spent bringing the host list up to
+/// date for draws, dispatches and indirect executions and recording them
+/// (pipeline waits included), since the last call: for the frame line.
+#[cfg(windows)]
+pub(crate) fn take_recording_us() -> u64 {
+    RECORDING_NS.swap(0, std::sync::atomic::Ordering::Relaxed) / 1000
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
@@ -779,8 +801,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
+    if let Some((texture, before, state)) = list.transition_legal(resource, state) {
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
@@ -1448,7 +1469,7 @@ extern "system" fn depth_bounds(_: This, min: f32, max: f32) {
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_state};
+    use super::{This, with_state, with_work};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1581,13 +1602,13 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_work(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_work(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1597,7 +1618,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_work(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1615,7 +1636,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_work(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1626,7 +1647,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_work(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1703,7 +1724,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        with_work(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {

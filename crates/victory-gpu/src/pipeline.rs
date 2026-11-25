@@ -400,6 +400,13 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Microseconds waited for host pipelines since the last call, all threads
+/// together.
+#[cfg(windows)]
+pub(crate) fn take_waited_us() -> u64 {
+    make::take_waited_us()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

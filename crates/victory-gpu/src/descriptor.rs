@@ -353,7 +353,11 @@ struct Views {
     shape_index: std::collections::BTreeMap<Shape, u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+/// Read for every descriptor of every table a draw reads, on every thread
+/// that records; written when the title writes a view not seen before. A
+/// lock readers share: one they each took in turn was the one lock all
+/// recording threads met at, thousands of times a frame.
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -362,6 +366,16 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     shape_index: std::collections::BTreeMap::new(),
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+/// [`VIEWS`] to read.
+fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
+    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [`VIEWS`] to change.
+fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
+    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
 /// them as one 64-bit key per slot). The top two bits of `generation` say
@@ -522,8 +536,9 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
-                    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(shape) = views.shape(shape) {
+                    // A shape seen before (nearly all of them) is only read.
+                    let known = views_read().shape_index.get(&shape).copied();
+                    if let Some(shape) = known.or_else(|| views_write().shape(shape)) {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
                     }
@@ -532,7 +547,14 @@ fn words_for(view: View) -> [u32; 2] {
             _ => {}
         }
     }
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(view)
+    // A view seen before is only read (`Views::entry` finds it the same).
+    {
+        let views = views_read();
+        if let Some(&i) = views.index.get(&view) {
+            return [i, views.list[i as usize].1];
+        }
+    }
+    views_write().entry(view)
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -546,7 +568,7 @@ fn words_for(view: View) -> [u32; 2] {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn views_kept() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = views_read();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
     let (mut constants, mut placed) = (0, 0);
@@ -697,7 +719,7 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = views_write();
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -722,12 +744,12 @@ pub(crate) fn forget(resource: usize) {
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let views = views_read();
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => VIEWS.lock().unwrap_or_else(|e| e.into_inner()).placed_of(i, generation),
+        PLACED => views_read().placed_of(i, generation),
         _ => None,
     }
 }
@@ -1104,8 +1126,8 @@ mod tests {
             View::Placed(_, r, _) => *r == resource,
             _ => false,
         };
-        let entries = || VIEWS.lock().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.lock().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let entries = || views_read().list.iter().filter(|(v, _)| mine(v)).count();
+        let shapes = || views_read().shapes.iter().filter(|s| s.1 == resource).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);

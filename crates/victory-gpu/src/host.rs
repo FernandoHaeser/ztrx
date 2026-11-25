@@ -728,12 +728,15 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    twins: Mutex<crate::fast::FastMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// The host pipeline objects the list binds and keeps
+    /// ([`HostList::bound_pipeline`]).
+    bound: Mutex<crate::fast::FastSet<usize>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -774,7 +777,7 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
+type States = crate::fast::FastMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
@@ -2832,6 +2835,7 @@ impl Host {
                 twins: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
+                bound: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
@@ -4433,6 +4437,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.bound.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -4466,9 +4471,26 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
+        self.transition_legal(resource, wanted)
+            .map(|(texture, before, _)| (texture, before))
+    }
+
+    /// As [`HostList::transition`], with the state the texture is moved to
+    /// (`wanted` as the texture allows it, [`legal_state`]). One look-up
+    /// of the host copy, and its flags as kept with it: asked for every
+    /// texture of every draw, this took the copy's lock twice and asked the
+    /// host for the texture's description once or twice.
+    pub(crate) fn transition_legal(
+        &self,
+        resource: crate::object::This,
+        wanted: u32,
+    ) -> Option<(&'static ID3D12Resource, u32, u32)> {
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        // SAFETY: the list holds the copy from here until it is reset
+        // (`states`, below, keeps it or a clone of the same one), and the
+        // caller records with the texture now.
+        let texture = unsafe { &*std::ptr::from_ref(&copy.texture) };
+        let wanted = legal_for(copy.flags, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -4477,7 +4499,7 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some((texture, before, wanted))
             }
         }
     }
@@ -4487,7 +4509,7 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = legal_for(copy.flags, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -4532,7 +4554,13 @@ impl HostList {
         write: bool,
     ) -> bool {
         const UNORDERED_ACCESS: u32 = 0x8;
-        // Asked for every texture a draw reads: most have no twin.
+        // Asked for every texture a draw reads: most have no twin, and
+        // most cannot have one (by their flags, without the lock of their
+        // host side). Their use is the caller's next step, which makes
+        // their host copy if it is not there.
+        if !crate::resource::may_twin(resource) {
+            return false;
+        }
         let Some(twin) = crate::resource::twin(resource) else {
             return false;
         };
@@ -4840,8 +4868,25 @@ impl HostList {
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// A host pipeline `pso` with root signature `root`, which the list
+    /// binds: kept alive until the list is reset (the title may release
+    /// its pipeline before it submits the list), and its name noted for
+    /// reports of slow submissions. Once per pipeline object and list: a
+    /// list binds the same few pipelines again and again, and each time
+    /// noted the name (compared with the others') and kept both objects
+    /// again (an interface query and a reference each).
+    pub(crate) fn bound_pipeline(&self, pso: &ID3D12PipelineState, root: &ID3D12RootSignature, name: &str) {
+        // The list keeps the object, so no other can come at its address.
+        if !self.bound.lock().unwrap_or_else(|e| e.into_inner()).insert(pso.as_raw() as usize) {
+            return;
+        }
+        self.used_pipeline(name);
+        self.keep(pso);
+        self.keep(root);
+    }
+
     /// Notes a pipeline the list binds.
-    pub(crate) fn used_pipeline(&self, name: &str) {
+    fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
@@ -5678,6 +5723,15 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        {
+            // The recording threads' time in draws and dispatches (summed
+            // over threads), and of it the waits for host pipelines.
+            let recording = crate::list::take_recording_us() as f64 / 1e3 / frames;
+            let waited = crate::pipeline::take_waited_us() as f64 / 1e3 / frames;
+            tracing::info!(
+                "recording draws and dispatches per frame, all threads: {recording:.1} ms, of it {waited:.1} ms waiting                  for host pipelines (VICTORY_PIPELINE_WAIT_MS)"
+            );
+        }
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
