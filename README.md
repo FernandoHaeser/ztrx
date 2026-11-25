@@ -44,8 +44,12 @@ keyboard acts as one while the game window has focus.
 
 ## Faster settings (optional, off by default)
 
-`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1` cut frame
-time on the test machines. Set them in PowerShell before running the script.
+`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3`, cut frame time on the test
+machines. Set them in PowerShell before running the script.
+
+On by default (set to `0` to turn one off when looking for a regression):
+`VICTORY_WIDE_BACK`, `VICTORY_WIDE_REFRESH`, `VICTORY_JOIN_COPIES`,
+`VICTORY_CARD_REHASH_RUNS`.
 
 ## Debugging switches
 
