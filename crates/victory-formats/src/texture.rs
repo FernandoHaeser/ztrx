@@ -594,9 +594,40 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        let (to, from) = (linear.as_mut_ptr(), tiled.as_ptr());
+        match self.plan(tiled.len(), mip, slice, None, linear.len(), row_pitch, depth_pitch)? {
+            // SAFETY: the plan proved every run inside both buffers, which
+            // are distinct (one is borrowed mutably).
+            Some(plan) => unsafe { plan.run(|t, l, len| std::ptr::copy_nonoverlapping(from.add(t), to.add(l), len)) },
+            None => self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+                linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+            })?,
+        }
+        Ok(())
+    }
+
+    /// Rows `rows` of what [`Layout::detile`] writes, for a subresource one
+    /// depth slice deep (2D textures and array slices; a 3D mip only if
+    /// it is one slice deep): `linear` begins with row `rows.start`. The
+    /// bytes written are those `detile` writes there; parts of a
+    /// subresource can so be detiled at once on several threads.
+    pub fn detile_rows(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        rows: std::ops::Range<u32>,
+        linear: &mut [u8],
+        row_pitch: usize,
+    ) -> Result<(), Error> {
+        let (to, from) = (linear.as_mut_ptr(), tiled.as_ptr());
+        match self.plan(tiled.len(), mip, slice, Some(rows), linear.len(), row_pitch, 0)? {
+            // SAFETY: as in `detile`.
+            Some(plan) => unsafe { plan.run(|t, l, len| std::ptr::copy_nonoverlapping(from.add(t), to.add(l), len)) },
+            // Not seen: the addresses of a valid layout lie inside it.
+            None => return Err(Error::Unsupported),
+        }
+        Ok(())
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -609,9 +640,180 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
+        let (to, from) = (tiled.as_mut_ptr(), linear.as_ptr());
+        match self.plan(tiled.len(), mip, slice, None, linear.len(), row_pitch, depth_pitch)? {
+            // SAFETY: as in `detile`.
+            Some(plan) => unsafe { plan.run(|t, l, len| std::ptr::copy_nonoverlapping(from.add(l), to.add(t), len)) },
+            None => self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+                tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
+            })?,
+        }
+        Ok(())
+    }
+
+    /// [`Layout::detile`] as it was before the planned copy: every run
+    /// copied through checked slices, row by row. Kept to check the fast
+    /// path against.
+    #[doc(hidden)]
+    pub fn detile_reference(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        })
+    }
+
+    /// The reference for [`Layout::tile`], as [`Layout::detile_reference`].
+    #[doc(hidden)]
+    pub fn tile_reference(
+        &self,
+        tiled: &mut [u8],
+        mip: u32,
+        slice: u32,
+        linear: &[u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
         self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
             tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
+    }
+
+    /// Checks a copy of one subresource as [`Layout::walk`] does (the same
+    /// errors) and lays out its runs once: the runs of one row, and each
+    /// row's tiled offset. With `part`, only those rows of a subresource
+    /// one slice deep, the first at the start of the linear buffer. `None`
+    /// if a run would leave the tiled buffer (not seen: the checked walk
+    /// is then used, as before).
+    #[allow(clippy::too_many_arguments)]
+    fn plan(
+        &self,
+        tiled_len: usize,
+        mip: u32,
+        slice: u32,
+        part: Option<std::ops::Range<u32>>,
+        linear_len: usize,
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<Option<Plan>, Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let ys = match part {
+            Some(ys) if m.depth != 1 || ys.start >= ys.end || ys.end > m.height => return Err(Error::Invalid),
+            Some(ys) => ys,
+            None => 0..m.height,
+        };
+        let first = self.check(m, ys.len() as u32, tiled_len, slice, linear_len, row_pitch, depth_pitch)?;
+        let n = self.desc.element_bytes as usize;
+        let linear = self.desc.swizzle == Swizzle::LINEAR;
+        let runs = if linear {
+            vec![(0, 0, m.width as usize * n)]
+        } else {
+            self.runs(m)
+        };
+        // Each row's tiled offset, depth slice by depth slice.
+        let mut rows = Vec::with_capacity(m.depth as usize * ys.len());
+        for z in 0..m.depth {
+            let (s, inner) = self.split(first + z);
+            let base = u64::from(s) * self.slice_size + m.offset;
+            for y in ys.clone() {
+                rows.push(if linear {
+                    (base + u64::from(y) * u64::from(m.pitch) * n as u64) as usize
+                } else {
+                    (base + self.row(m, y, inner)) as usize
+                });
+            }
+        }
+        // Every run of every row inside `tiled`: the row offsets and the
+        // run ends add up independently. (The linear side was checked: a
+        // run ends inside its row's `bytes`.)
+        let reach = runs.iter().map(|&(t, _, len)| t + len).max().unwrap_or(0);
+        let last_row = rows.iter().copied().max().unwrap_or(0);
+        if last_row.checked_add(reach).is_none_or(|end| end > tiled_len) {
+            return Ok(None);
+        }
+        // One width for every run but the last (a mip can end partway
+        // through it), or each run's own (a tail mip that starts partway
+        // into a block).
+        let body = &runs[..runs.len() - 1];
+        let width = body.first().map_or(0, |r| r.2);
+        let width = if body.iter().all(|r| r.2 == width) { width } else { 0 };
+        Ok(Some(Plan {
+            runs,
+            width,
+            rows,
+            height: ys.len(),
+            row_pitch,
+            depth_pitch,
+        }))
+    }
+
+    /// The checks of a copy of `height` rows of mip `m` of `slice`; returns
+    /// the first slice it covers.
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        &self,
+        m: &Mip,
+        height: u32,
+        tiled_len: usize,
+        slice: u32,
+        linear_len: usize,
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<u32, Error> {
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let bytes = m.width as usize * self.desc.element_bytes as usize;
+        let need = (m.depth as usize - 1)
+            .checked_mul(depth_pitch)
+            .zip((height as usize - 1).checked_mul(row_pitch))
+            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+            return Err(Error::TooSmall);
+        }
+        Ok(first)
+    }
+
+    /// The contiguous runs of one row of mip `m` (tiled offset from the
+    /// row's, linear offset from the row's, length): the row and depth add
+    /// one common base to every column, so the same runs repeat on every
+    /// row, including mip tails.
+    fn runs(&self, m: &Mip) -> Vec<(usize, usize, usize)> {
+        let n = self.desc.element_bytes as usize;
+        let bytes = m.width as usize * n;
+        let mut runs = Vec::new();
+        let mut first_linear = 0;
+        let mut first_tiled = self.column(m, 0) as usize;
+        for x in 1..m.width {
+            let offset = self.column(m, x) as usize;
+            let at = x as usize * n;
+            if offset != first_tiled + (at - first_linear) {
+                runs.push((first_tiled, first_linear, at - first_linear));
+                first_tiled = offset;
+                first_linear = at;
+            }
+        }
+        runs.push((first_tiled, first_linear, bytes - first_linear));
+        runs
     }
 
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
@@ -628,49 +830,11 @@ impl Layout {
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
-        let first = if self.desc.dimension == Dimension::Tex3d {
-            if slice != 0 {
-                return Err(Error::Invalid);
-            }
-            0
-        } else {
-            slice
-        };
-        if first >= self.slices {
-            return Err(Error::Invalid);
-        }
-        if !self.addressable() {
-            return Err(Error::Unsupported);
-        }
+        let first = self.check(m, m.height, tiled_len, slice, linear_len, row_pitch, depth_pitch)?;
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
-        let need = (depth as usize - 1)
-            .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
-            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
-            .and_then(|offset| offset.checked_add(bytes))
-            .ok_or(Error::TooSmall)?;
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
-            return Err(Error::TooSmall);
-        }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
-        // The row and depth contribute one common base to every column, so
-        // the same contiguous runs repeat on every row, including mip tails.
-        let mut runs = Vec::new();
-        if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
-            for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
-                }
-            }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
-        }
+        let runs = if linear { Vec::new() } else { self.runs(m) };
         // A mip can end partway through the last run. Check the other runs
         // once so each row can copy them with a compile-time length.
         let (body, last) = runs.split_at(runs.len().saturating_sub(1));
@@ -699,6 +863,48 @@ impl Layout {
             }
         }
         Ok(())
+    }
+}
+
+/// A copy of one subresource between tiled memory and linear rows, checked
+/// to stay inside both buffers ([`Layout::plan`]).
+struct Plan {
+    /// (tiled offset from the row's, linear offset from the row's, length).
+    runs: Vec<(usize, usize, usize)>,
+    /// The length of every run but the last, or 0 if they differ.
+    width: usize,
+    /// The tiled offset of each row, depth slice by depth slice.
+    rows: Vec<usize>,
+    height: usize,
+    row_pitch: usize,
+    depth_pitch: usize,
+}
+
+impl Plan {
+    /// Calls `copy(tiled offset, linear offset, length)` for every run, row
+    /// by row: the linear side is written in order, as write-combined
+    /// staging memory wants it (a block at a time measured no faster, and
+    /// slower for the largest textures). Runs of the usual widths copy at a
+    /// fixed length.
+    ///
+    /// # Safety
+    /// `copy` is given only ranges [`Layout::plan`] checked against the
+    /// lengths it was given; it must copy between buffers that long.
+    unsafe fn run(&self, mut copy: impl FnMut(usize, usize, usize)) {
+        let (body, last) = self.runs.split_at(self.runs.len() - 1);
+        for (i, &tiled_row) in self.rows.iter().enumerate() {
+            let (z, y) = (i / self.height, i % self.height);
+            let linear_row = z * self.depth_pitch + y * self.row_pitch;
+            match self.width {
+                2 => copy_runs::<2>(body, tiled_row, linear_row, &mut copy),
+                4 => copy_runs::<4>(body, tiled_row, linear_row, &mut copy),
+                8 => copy_runs::<8>(body, tiled_row, linear_row, &mut copy),
+                16 => copy_runs::<16>(body, tiled_row, linear_row, &mut copy),
+                32 => copy_runs::<32>(body, tiled_row, linear_row, &mut copy),
+                _ => copy_runs::<0>(body, tiled_row, linear_row, &mut copy),
+            }
+            copy_runs::<0>(last, tiled_row, linear_row, &mut copy);
+        }
     }
 }
 
@@ -1063,6 +1269,203 @@ mod tests {
             layout.detile(&tiled, 0, 0, &mut linear, 16, usize::MAX),
             Err(Error::TooSmall)
         );
+    }
+
+    /// Every swizzle mode without XOR, element size, dimension and a range
+    /// of sizes and mip counts: the planned copies write exactly what the
+    /// checked walk writes, both ways, padding between rows untouched.
+    #[test]
+    fn planned_copies_match_the_walk() {
+        let modes = [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ];
+        let sizes: [(u32, u32); 8] = [(1, 1), (3, 5), (16, 16), (37, 300), (64, 64), (129, 65), (256, 31), (500, 260)];
+        let mut cases = 0;
+        for swizzle in modes {
+            for e in 0..5 {
+                for &(w, h) in &sizes {
+                    for (dimension, depth) in [(Dimension::Tex2d, 1), (Dimension::Tex2d, 3), (Dimension::Tex3d, 9)] {
+                        for block in [1, 4] {
+                            let mips = 32 - w.max(h).leading_zeros();
+                            let d = Desc {
+                                dimension,
+                                depth,
+                                block,
+                                ..desc(w, h, mips, 1 << e, swizzle)
+                            };
+                            let Ok(l) = Layout::new(&d) else { continue };
+                            cases += 1;
+                            check_against_walk(&l, cases);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 400, "{cases} layouts");
+    }
+
+    fn check_against_walk(l: &Layout, seed: usize) {
+        let d = l.desc;
+        let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 131 + i / 977 + seed) as u8).collect();
+        let n = d.element_bytes as usize;
+        let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
+        for slice in 0..slices {
+            for mip in 0..d.mips {
+                let m = l.mips[mip as usize];
+                let row = m.width as usize * n + (seed % 3) * 7;
+                let plane = row * m.height as usize + 5;
+                let len = plane * m.depth as usize;
+                let (mut fast, mut slow) = (vec![0xa5; len], vec![0xa5; len]);
+                l.detile(&tiled, mip, slice, &mut fast, row, plane).unwrap();
+                l.detile_reference(&tiled, mip, slice, &mut slow, row, plane).unwrap();
+                assert!(fast == slow, "{d:?} mip {mip} slice {slice}: detiled differently");
+                if m.depth == 1 {
+                    // In parts of rows, as threads would: the same bytes.
+                    let mut parts = vec![0xa5; len];
+                    let cut = [0, m.height / 3, m.height / 3 + 1, m.height];
+                    for ys in cut.windows(2) {
+                        let (top, bottom) = (ys[0], ys[1].max(ys[0]));
+                        if top == bottom {
+                            let mut nothing = [];
+                            assert_eq!(
+                                l.detile_rows(&tiled, mip, slice, top..bottom, &mut nothing, row),
+                                Err(Error::Invalid)
+                            );
+                            continue;
+                        }
+                        let at = top as usize * row;
+                        let end = (bottom as usize - 1) * row + m.width as usize * n;
+                        l.detile_rows(&tiled, mip, slice, top..bottom, &mut parts[at..end], row).unwrap();
+                    }
+                    assert!(parts == slow, "{d:?} mip {mip} slice {slice}: detiled in parts differently");
+                }
+                let linear: Vec<u8> = (0..len).map(|i| (i * 7 + seed) as u8).collect();
+                let (mut fast, mut slow) = (tiled.clone(), tiled.clone());
+                l.tile(&mut fast, mip, slice, &linear, row, plane).unwrap();
+                l.tile_reference(&mut slow, mip, slice, &linear, row, plane).unwrap();
+                assert!(fast == slow, "{d:?} mip {mip} slice {slice}: tiled differently");
+            }
+        }
+    }
+
+    /// The planned copy refuses what the walk refuses, with the same error.
+    #[test]
+    fn planned_copies_refuse_as_the_walk_does() {
+        let l = Layout::new(&desc(64, 64, 7, 4, Swizzle::SW_4KB_S)).unwrap();
+        let tiled = vec![0u8; l.size as usize];
+        for (tiled_len, mip, slice, linear_len, row) in [
+            (l.size as usize - 1, 0, 0, 256 * 64, 256),
+            (l.size as usize, 7, 0, 256 * 64, 256),
+            (l.size as usize, 0, 1, 256 * 64, 256),
+            (l.size as usize, 0, 0, 256 * 64 - 1, 256),
+            (l.size as usize, 0, 0, 256 * 64, 255),
+        ] {
+            let mut a = vec![0u8; linear_len];
+            let mut b = vec![0u8; linear_len];
+            assert_eq!(
+                l.detile(&tiled[..tiled_len], mip, slice, &mut a, row, 0),
+                l.detile_reference(&tiled[..tiled_len], mip, slice, &mut b, row, 0)
+            );
+            assert!(l.detile(&tiled[..tiled_len], mip, slice, &mut a, row, 0).is_err());
+        }
+    }
+
+    /// The planned detiling against the walk, on textures as streamed in a
+    /// world: BC7 and RGBA8 chains in 64 KiB and 4 KiB blocks. Run with
+    /// `cargo test --release -p victory-formats -- --ignored --nocapture detile_speed`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn detile_speed() {
+        let cases = [
+            ("BC7 4096x4096 64KB_D", Desc { block: 4, ..desc(4096, 4096, 13, 16, Swizzle::SW_64KB_D) }),
+            ("BC1 2048x2048 64KB_S", Desc { block: 4, ..desc(2048, 2048, 12, 8, Swizzle::SW_64KB_S) }),
+            ("RGBA8 2048x2048 64KB_D", desc(2048, 2048, 12, 4, Swizzle::SW_64KB_D)),
+            ("RGBA8 1024x1024 4KB_S", desc(1024, 1024, 11, 4, Swizzle::SW_4KB_S)),
+            ("R8 2048x2048 64KB_D", desc(2048, 2048, 12, 1, Swizzle::SW_64KB_D)),
+            ("RGBA16F 1024x1024 64KB_S", desc(1024, 1024, 11, 8, Swizzle::SW_64KB_S)),
+        ];
+        for (name, d) in cases {
+            let l = Layout::new(&d).unwrap();
+            let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 31) as u8).collect();
+            let n = d.element_bytes as usize;
+            let outs: Vec<(usize, Vec<u8>)> = l
+                .mips
+                .iter()
+                .map(|m| {
+                    let row = (m.width as usize * n).next_multiple_of(256);
+                    (row, vec![0u8; row * m.height as usize])
+                })
+                .collect();
+            let time = |fast: bool, outs: &mut Vec<(usize, Vec<u8>)>| {
+                let rounds = 20;
+                let started = std::time::Instant::now();
+                for _ in 0..rounds {
+                    for (mip, (row, out)) in outs.iter_mut().enumerate() {
+                        let len = out.len();
+                        if fast {
+                            l.detile(&tiled, mip as u32, 0, out, *row, len).unwrap();
+                        } else {
+                            l.detile_reference(&tiled, mip as u32, 0, out, *row, len).unwrap();
+                        }
+                    }
+                }
+                started.elapsed() / rounds
+            };
+            let mut outs = outs;
+            time(true, &mut outs);
+            let slow = time(false, &mut outs);
+            let fast = time(true, &mut outs);
+            // Each mip cut in four parts of rows, on four threads.
+            let wide = |outs: &mut Vec<(usize, Vec<u8>)>| {
+                let rounds = 20;
+                let started = std::time::Instant::now();
+                for _ in 0..rounds {
+                    std::thread::scope(|scope| {
+                        let mut parts: Vec<Vec<(u32, std::ops::Range<u32>, usize, &mut [u8])>> =
+                            (0..4).map(|_| Vec::new()).collect();
+                        for (mip, (row, out)) in outs.iter_mut().enumerate() {
+                            let height = l.mips[mip].height;
+                            let mut rest = &mut out[..];
+                            let mut top = 0;
+                            for k in 0..4u32 {
+                                let bottom = height * (k + 1) / 4;
+                                if bottom > top {
+                                    let (part, tail) = rest.split_at_mut((bottom - top) as usize * *row);
+                                    rest = tail;
+                                    parts[k as usize].push((mip as u32, top..bottom, *row, part));
+                                    top = bottom;
+                                }
+                            }
+                        }
+                        for part in parts {
+                            let (l, tiled) = (&l, &tiled);
+                            scope.spawn(move || {
+                                for (mip, ys, row, out) in part {
+                                    l.detile_rows(tiled, mip, 0, ys, out, row).unwrap();
+                                }
+                            });
+                        }
+                    });
+                }
+                started.elapsed() / rounds
+            };
+            let threads = wide(&mut outs);
+            let mb = l.size as f64 / 1e6;
+            println!(
+                "{name}: {mb:.1} MB, walk {slow:?} ({:.2} GB/s), planned {fast:?} ({:.2} GB/s), {:.2}x; on 4 threads {threads:?} ({:.2} GB/s), {:.2}x",
+                mb / 1e3 / slow.as_secs_f64(),
+                mb / 1e3 / fast.as_secs_f64(),
+                slow.as_secs_f64() / fast.as_secs_f64(),
+                mb / 1e3 / threads.as_secs_f64(),
+                slow.as_secs_f64() / threads.as_secs_f64()
+            );
+        }
     }
 
     #[test]
