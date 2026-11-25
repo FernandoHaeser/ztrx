@@ -377,6 +377,19 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Whether title texture `this` may have a colour twin: a depth texture
+/// with unordered access ([`twin_texture`]). Asked from its description
+/// alone, without the lock of its host side.
+#[cfg(windows)]
+pub(crate) fn may_twin(this: This) -> bool {
+    const DEPTH_AND_UNORDERED: u32 = 6;
+    if this.is_null() {
+        return false;
+    }
+    let d = &resource(this).desc;
+    d.dimension != BUFFER && d.flags & DEPTH_AND_UNORDERED == DEPTH_AND_UNORDERED
+}
+
 /// The colour twin of title texture `this`, if it has one.
 #[cfg(windows)]
 pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
@@ -1122,6 +1135,9 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
+    /// Its host resource flags, for the states it may take
+    /// (`crate::host::legal_for`) without asking the host every time.
+    pub(crate) flags: u32,
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
@@ -1543,12 +1559,15 @@ impl HostTexture {
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
+        // SAFETY: a plain query on a live resource.
+        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
+            flags,
             filled: false,
         }
     }
@@ -1571,7 +1590,7 @@ impl Drop for HostTexture {
 /// (never released), for the memory line.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
-    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+    PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner()).len() as u64
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -2014,9 +2033,11 @@ pub(crate) extern "system" fn create_at_address(
 /// The resource is kept for the run (views and lists name its address);
 /// its host texture is let go when nothing names it any more
 /// ([`let_go_idle`]) and made again on the next use.
+/// Looked up for every placed texture view of every draw, on every
+/// recording thread: a lock readers share, written only to add one.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PLACED_TEXTURES: std::sync::RwLock<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
 
 /// The bytes of title memory a texture with the resource description
 /// `desc` (as words) takes where the title placed it; `None` for a buffer
@@ -2035,7 +2056,16 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let known = PLACED_TEXTURES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, *desc))
+        .copied();
+    if let Some(r) = known {
+        return Some(r as This);
+    }
+    let mut map = PLACED_TEXTURES.write().unwrap_or_else(|e| e.into_inner());
+    // Another thread may have made it meanwhile.
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
@@ -2669,6 +2699,57 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    /// A texture that cannot have a twin is told so by its flags
+    /// (`may_twin`), and a list moves its host copy between states as the
+    /// texture allows them (`transition_legal`, by the flags kept with the
+    /// copy): its first use records nothing, a move to the state it is in
+    /// records nothing, a move to a state it may not take records the
+    /// state it may.
+    #[cfg(windows)]
+    #[test]
+    fn a_list_moves_a_texture_by_its_kept_flags() {
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        const RENDER_TARGET: u32 = 0x4;
+        const COPY_DEST: u32 = 0x400;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let mut plain = null;
+        let desc = texture(4, 4, 28, 1);
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut plain),
+            S_OK
+        );
+        let mut depth = null;
+        let desc = ResourceDesc {
+            flags: 6,
+            ..texture(4, 4, 55, 1)
+        };
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0x10, null.cast(), &RESOURCE_IIDS[0], &mut depth),
+            S_OK
+        );
+        assert!(!may_twin(plain) && may_twin(depth) && !may_twin(null));
+        let copy = host_copy(plain).unwrap();
+        // SAFETY: a live resource.
+        assert_eq!(copy.flags, unsafe { copy.texture.GetDesc() }.Flags.0 as u32);
+
+        let list = host.new_list().unwrap();
+        assert!(!list.twin_use(plain, false, false));
+        assert!(list.transition_legal(plain, SHADER_RESOURCE).is_none());
+        assert!(list.transition_legal(plain, SHADER_RESOURCE).is_none());
+        let (texture, before, state) = list.transition_legal(plain, COPY_DEST).unwrap();
+        assert_eq!((before, state), (SHADER_RESOURCE, COPY_DEST));
+        assert_eq!(*texture, copy.texture);
+        // Not a render target: the state it may take of those asked.
+        let (_, before, state) = list.transition_legal(plain, RENDER_TARGET | SHADER_RESOURCE).unwrap();
+        assert_eq!((before, state), (COPY_DEST, crate::host::legal_for(copy.flags, RENDER_TARGET | SHADER_RESOURCE)));
+        assert_eq!(state, crate::host::legal_state(&copy.texture, RENDER_TARGET | SHADER_RESOURCE));
+        assert_eq!(list.transition(plain, COPY_DEST).map(|(_, before)| before), Some(state));
+        list.close();
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets

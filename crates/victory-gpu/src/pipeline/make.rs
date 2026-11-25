@@ -110,6 +110,16 @@ fn wait_budget() -> Duration {
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
+/// Microseconds the recording threads waited for host pipelines, since
+/// the last [`take_waited_us`].
+static WAITED_US: AtomicU64 = AtomicU64::new(0);
+
+/// Microseconds waited for host pipelines since the last call, all threads
+/// together (for the frame line).
+pub(crate) fn take_waited_us() -> u64 {
+    WAITED_US.swap(0, Ordering::Relaxed)
+}
+
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
@@ -194,6 +204,7 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     let waited = started.elapsed().min(left);
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
