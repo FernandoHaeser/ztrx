@@ -597,16 +597,25 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
-    let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    if map_pages(&mut physical, address as usize, n, pages) {
+        address
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+/// [`XMemMapPhysicalPages`] with the page table and the remapping lock held
+/// by the caller. False if a page or the host fails.
+fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: *const usize) -> bool {
+    unmap(physical, base, n * PAGE);
     if pages.is_null() {
-        return address;
+        return true;
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
@@ -614,7 +623,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return std::ptr::null_mut();
+            return false;
         };
         // One view per run of consecutive slices of one section.
         let run = 1 + pages[i + 1..]
@@ -626,12 +635,12 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
-            return std::ptr::null_mut();
+        if !map(physical, base + i * PAGE, run * PAGE, first) {
+            return false;
         }
         i += run;
     }
-    address
+    true
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
@@ -644,6 +653,13 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    // The page table and the remapping lock once for the whole scatter, not
+    // once a page: every taking of the lock waits for the texture reads in
+    // place under way, and every read begun since waits for it (a scatter
+    // of n pages was n such meetings, seconds a frame while the world
+    // streams in).
+    let mut physical = physical();
+    let _changing = victory_gpu::title_memory_remapping();
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
@@ -656,7 +672,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                 },
             )
         };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+        if !map_pages(&mut physical, address as usize, 1, page) {
             return 0;
         }
     }

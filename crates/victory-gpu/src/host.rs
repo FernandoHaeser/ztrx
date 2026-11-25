@@ -5999,6 +5999,15 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
+            let [remaps, remap_wait, remap_held] =
+                [0, 1, 2].map(|i| crate::watch::REMAPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if remaps > 0.0 {
+                tracing::info!(
+                    "title memory remappings per frame: {remaps:.0}, {:.1} ms waiting for reads in place, {:.1} ms holding                      title memory still",
+                    remap_wait / 1000.0,
+                    remap_held / 1000.0
+                );
+            }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
                 tracing::info!(
