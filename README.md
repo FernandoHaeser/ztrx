@@ -59,6 +59,7 @@ On by default (set to `0` to turn one off when looking for a regression):
 | `VICTORY_KEYS=30:Enter,35:X` | press keys at those seconds (diagnostics build) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
+| `VICTORY_ADAPTER=NVIDIA` | run on the adapter whose name contains this (default: the fastest one, so a laptop's card rather than its integrated GPU; the log names it) |
 
 Diagnostics build: `cargo build --profile diag -p victory --features diagnostics`
 
